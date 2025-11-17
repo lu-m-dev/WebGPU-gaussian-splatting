@@ -1,4 +1,5 @@
 import { PointCloud } from '../utils/load';
+import commonWSGL from '../shaders/common.wgsl'
 import preprocessWGSL from '../shaders/preprocess.wgsl';
 import renderWGSL from '../shaders/gaussian.wgsl';
 import { get_sorter,c_histogram_block_rows,C } from '../sort/sort';
@@ -44,20 +45,20 @@ export default function get_renderer(
     new Uint32Array([6, pc.num_points, 0, 0])
   );
 
-  const SPLAT_SIZE = 32;
+  const SPLAT_SIZE = 24;
   const splat_buffer = createBuffer(
     device,
     'splats buffer',
     pc.num_points * SPLAT_SIZE,
-    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.VERTEX
+    GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   );
 
   const settings_buffer = createBuffer(
     device,
     'render settings buffer',
-    4 * Float32Array.BYTES_PER_ELEMENT,
+    4 * Uint32Array.BYTES_PER_ELEMENT,
     GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
-    new Float32Array([1.0, pc.sh_deg, pc.num_points, 0.0])
+    new Float32Array([1.0, pc.sh_deg, 0.0, 0.0])
   );
 
   // ===============================================
@@ -67,7 +68,7 @@ export default function get_renderer(
     label: 'preprocess',
     layout: 'auto',
     compute: {
-      module: device.createShaderModule({ code: preprocessWGSL }),
+      module: device.createShaderModule({ code: commonWSGL + preprocessWGSL }),
       entryPoint: 'preprocess',
       constants: {
         workgroupSize: C.histogram_wg_size,
@@ -110,7 +111,7 @@ export default function get_renderer(
     ],
   });
 
-  const render_shader = device.createShaderModule({ code: renderWGSL });
+  const render_shader = device.createShaderModule({ code: commonWSGL + renderWGSL });
   const render_pipeline = device.createRenderPipeline({
     label: 'gaussian render',
     layout: 'auto',
@@ -121,44 +122,44 @@ export default function get_renderer(
     fragment: {
       module: render_shader,
       entryPoint: 'fs_main',
-      targets: [{ format: presentation_format }],
+      targets: [{
+        format: presentation_format,
+        blend: {
+          color: {
+            srcFactor: 'one',
+            dstFactor: 'one-minus-src-alpha',
+            operation: 'add',
+          },
+          alpha: {
+            srcFactor: 'one',
+            dstFactor: 'one-minus-src-alpha',
+            operation: 'add',
+          },
+        },
+        writeMask: GPUColorWrite.ALL,
+      }],
     },
     primitive: {
       topology: 'triangle-list',
     },
   });
 
-  const camera_bind_group = device.createBindGroup({
-    label: 'gaussian camera',
-    layout: render_pipeline.getBindGroupLayout(0),
-    entries: [{ binding: 0, resource: { buffer: camera_buffer } }],
-  });
-
   const render_bind_group = device.createBindGroup({
     label: 'gaussian splats',
-    layout: render_pipeline.getBindGroupLayout(1),
+    layout: render_pipeline.getBindGroupLayout(0),
     entries: [
       { binding: 0, resource: { buffer: splat_buffer } },
       { binding: 1, resource: { buffer: sorter.ping_pong[0].sort_indices_buffer } },
-      { binding: 2, resource: { buffer: settings_buffer } },
     ],
   });
-  
+
 
   // ===============================================
   //    Command Encoder Functions
   // ===============================================
-  let gaussian_multiplier = 1.0;
-
-  function set_gaussian_multiplier(v: number) {
-    gaussian_multiplier = v;
-    device.queue.writeBuffer(settings_buffer, 0, new Float32Array([gaussian_multiplier, pc.sh_deg, pc.num_points, 0.0]));
-  }
-
   function record_preprocess(encoder: GPUCommandEncoder) {
-    device.queue.writeBuffer(sorter.sort_info_buffer, 0, new Uint32Array([0, 0, 0, 0, 0]));
-    device.queue.writeBuffer(sorter.sort_dispatch_indirect_buffer, 0, new Uint32Array([0, 1, 1]));
-    device.queue.writeBuffer(settings_buffer, 0, new Float32Array([gaussian_multiplier, pc.sh_deg, pc.num_points, 0.0]));
+    device.queue.writeBuffer(sorter.sort_info_buffer, 0, nulling_data);
+    device.queue.writeBuffer(sorter.sort_dispatch_indirect_buffer, 0, nulling_data);
 
     const pass = encoder.beginComputePass({ label: 'preprocess' });
     pass.setPipeline(preprocess_pipeline);
@@ -182,8 +183,7 @@ export default function get_renderer(
       ],
     });
     pass.setPipeline(render_pipeline);
-    pass.setBindGroup(0, camera_bind_group);
-    pass.setBindGroup(1, render_bind_group);
+    pass.setBindGroup(0, render_bind_group);
     pass.drawIndirect(draw_indirect_buffer, 0);
     pass.end();
   }
@@ -200,6 +200,8 @@ export default function get_renderer(
       record_render(encoder, texture_view);
     },
     camera_buffer,
-    set_gaussian_multiplier,
+    set_gaussian_multiplier(v: number) {
+      device.queue.writeBuffer(settings_buffer, 0, new Float32Array([v, pc.sh_deg, 0.0, 0.0]));
+    },
   };
 }

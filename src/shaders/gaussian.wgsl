@@ -4,25 +4,22 @@ struct VertexOutput {
     @location(0) rgba: vec4<f32>,
     @location(1) opacity: f32,
     @location(2) center: vec2<f32>,
-    @location(3) radius: vec2<f32>,
-    @location(4) conic: vec3<f32>,
+    @location(3) conic: vec3<f32>,
 };
 
-// struct Splat {
-//     //TODO: information defined in preprocess compute shader
-// };
-
-import { Splat, CameraUniforms, RenderSettings } from './preprocess.wgsl';
-
 @group(0) @binding(0)
-var<uniform> camera: CameraUniforms;
-
-@group(1) @binding(0)
 var<storage, read> splats : array<Splat>;
-@group(1) @binding(1)
+@group(0) @binding(1)
 var<storage, read> sort_indices : array<u32>;
-@group(1) @binding(2)
-var<storage, read> renderer_settings : RenderSettings;
+
+const NORMALS: array<vec2<f32>,6> = array<vec2<f32>,6>(
+    vec2<f32>(-1.0f, -1.0f),
+    vec2<f32>( 1.0f, -1.0f),
+    vec2<f32>( 1.0f,  1.0f),
+    vec2<f32>(-1.0f, -1.0f),
+    vec2<f32>( 1.0f,  1.0f),
+    vec2<f32>(-1.0f,  1.0f),
+);
 
 @vertex
 fn vs_main(
@@ -32,65 +29,43 @@ fn vs_main(
     //TODO: reconstruct 2D quad based on information from splat, pass 
     var out: VertexOutput;
     let index = sort_indices[instance_index];
+    let splat = splats[index];
 
-    if (index >= renderer_settings.num_points) {
-        out.position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-        out.rgba = vec4<f32>(0.0);
-        out.opacity = 0.0;
-        out.center = vec2<f32>(0.0);
-        out.radius = vec2<f32>(0.0);
-        out.conic = vec3<f32>(0.0);
-        return out;
-    }
+    let center = unpack2x16float(splat.center);
+    let size = unpack2x16float(splat.size);
+    let rg = unpack2x16float(splat.rgba[0]);
+    let ba = unpack2x16float(splat.rgba[1]);
+    let conic_xy = unpack2x16float(splat.conic[0]);
+    let conic_zw = unpack2x16float(splat.conic[1]);
 
-    let g = splats[index];
-
-    let center = unpack2x16float(g.center);
-    let radius = unpack2x16float(g.size);
-    let col_rg = unpack2x16float(g.rgba[0]);
-    let col_ba = unpack2x16float(g.rgba[1]);
-    let color = vec4<f32>(col_rg.x, col_rg.y, col_ba.x, col_ba.y);
-
-    let conic0 = unpack2x16float(g.conic[0]);
-    let conicz = unpack2x16float(g.conic[1]).x;
-    let conic = vec3<f32>(conic0.x, conic0.y, conicz);
-    let opacity = unpack2x16float(g.opacity).x;
-
-    const normals: array<vec2<f32>, 6> = array<vec2<f32>,6>(
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 1.0, -1.0),
-        vec2<f32>( 1.0,  1.0),
-        vec2<f32>(-1.0, -1.0),
-        vec2<f32>( 1.0,  1.0),
-        vec2<f32>(-1.0,  1.0),
-    );
-
-    let offset = normals[vertex_index] * radius;
+    let conic = vec3<f32>(conic_xy, conic_zw.x);
+    let radius = conic_zw.y;
+    let offset = NORMALS[vertex_index % 6u] * radius / size;
 
     out.position = vec4<f32>(center + offset, 0.0f, 1.0f);
-    out.rgba = color;
-    out.opacity = opacity;
-    out.center = center;
-    out.radius = radius;
+    out.rgba = vec4<f32>(rg, ba.x, 1.0f);
+    out.opacity = ba.y;
+    out.center = vec2<f32>(center.x + 1.0f, -center.y + 1.0f) * size;
     out.conic = conic;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let ndc = (in.position.xy / camera.viewport) * 2.0f - 1.0f;
-    let radius = (ndc - in.center) * (camera.viewport / 2.0f);
-
     let x = in.conic.x;
     let y = in.conic.y;
     let z = in.conic.z;
-    let rx = radius.x;
-    let ry = radius.y;
 
-    let prod = x * Math.power(rx, 2) + z * Math.power(ry, 2) - 2.0f * y * rx * ry;
+    let offset = in.position.xy - in.center;
+    let rx = offset.x;
+    let ry = offset.y;
+
+    let prod = x * rx * rx + z * ry * ry + 2.0f * y * rx * ry;
 
     if (prod < 0.0f) {
-        return vec4<f32>(0.0f);
+        discard;
     }
-    return in.rgba * min(in.opacity * exp(-prod / 2.0f), 0.99f);
+
+    let opacity = clamp(in.opacity * exp(-0.5f * prod), 0.0f, 0.99f);
+    return in.rgba * opacity;
 }
